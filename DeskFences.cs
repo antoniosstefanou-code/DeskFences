@@ -148,7 +148,179 @@ public class AppConfig
     public List<FenceData> Fences { get; set; }
     // Μέγεθος εικονιδίων σε λογικά pixels (στο 100%)· 0 = προεπιλογή (32, όπως τα μεσαία του desktop).
     public int IconSize { get; set; }
+    // false (προεπιλογή): τα εικονίδια της επιφάνειας εργασίας μετακινούνται αυτόματα έξω από τα fences.
+    public bool AllowIconsUnder { get; set; }
     public AppConfig() { Fences = new List<FenceData>(); }
+}
+
+// Κρατά τα εικονίδια της επιφάνειας εργασίας έξω από τα fences: όποιο πέφτει κάτω από fence
+// μετακινείται (μόνο η θέση του, όχι το αρχείο) στην πλησιέστερη ελεύθερη θέση του πλέγματος.
+// Χρησιμοποιεί το IFolderView της επιφάνειας εργασίας του Explorer.
+static class DesktopIcons
+{
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+
+    [ComImport, Guid("85CB6900-4D95-11CF-960C-0080C7F4EE85"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    interface IShellWindows
+    {
+        void _1(); void _2(); void _3(); void _4(); void _5(); void _6(); void _7(); void _8();
+        [return: MarshalAs(UnmanagedType.IDispatch)]
+        object FindWindowSW([In, MarshalAs(UnmanagedType.Struct)] ref object loc,
+            [In, MarshalAs(UnmanagedType.Struct)] ref object locRoot, int swClass, out int hwnd, int options);
+    }
+
+    [ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IComServiceProvider
+    {
+        [return: MarshalAs(UnmanagedType.IUnknown)] object QueryService(ref Guid sid, ref Guid iid);
+    }
+
+    [ComImport, Guid("000214E2-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellBrowser
+    {
+        void _1(); void _2(); void _3(); void _4(); void _5(); void _6();
+        void _7(); void _8(); void _9(); void _10(); void _11(); void _12();
+        [return: MarshalAs(UnmanagedType.IUnknown)] object QueryActiveShellView();
+    }
+
+    [ComImport, Guid("000214E3-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellView { IntPtr GetWindow(); }
+
+    [ComImport, Guid("CDE725B0-CCC9-4519-917E-325D72FAB4CE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IFolderView
+    {
+        void _GetCurrentViewMode(); void _SetCurrentViewMode(); void _GetFolder();
+        IntPtr Item(int index);
+        int ItemCount(uint flags);
+        void _Items(); void _GetSelectionMarkedItem(); void _GetFocusedItem();
+        POINT GetItemPosition(IntPtr pidl);
+        POINT GetSpacing();
+        void _GetDefaultSpacing();
+        [PreserveSig] int GetAutoArrange();
+        void _SelectItem();
+        void SelectAndPositionItems(uint cidl, [MarshalAs(UnmanagedType.LPArray)] IntPtr[] apidl,
+            [MarshalAs(UnmanagedType.LPArray)] POINT[] apt, uint flags);
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern IntPtr FindWindowEx(IntPtr p, IntPtr after, string cls, string title);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+
+    static readonly Guid CLSID_ShellWindows = new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
+    static readonly Guid SID_STopLevelBrowser = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837");
+    static readonly Guid IID_IShellBrowser = new Guid("000214E2-0000-0000-C000-000000000046");
+    const int SWC_DESKTOP = 8, SWFO_NEEDDISPATCH = 1;
+    const uint SVGIO_ALLVIEW = 2, SVSI_POSITIONITEM = 0x80;
+
+    static string logPath;
+
+    // fences: θέσεις των fences σε συντεταγμένες οθόνης. Επιστρέφει πόσα εικονίδια μετακινήθηκαν.
+    public static int KeepOutOf(List<Rectangle> fences, string log)
+    {
+        logPath = log;
+        if (fences.Count == 0) return 0;
+        object sw = null, disp = null, sb = null, sv = null;
+        var pidls = new List<IntPtr>();
+        try
+        {
+            sw = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ShellWindows));
+            object loc = 0 /* CSIDL_DESKTOP */, root = null;
+            int hwnd;
+            disp = ((IShellWindows)sw).FindWindowSW(ref loc, ref root, SWC_DESKTOP, out hwnd, SWFO_NEEDDISPATCH);
+            if (disp == null) return 0;
+            Guid sid = SID_STopLevelBrowser, iid = IID_IShellBrowser;
+            sb = ((IComServiceProvider)disp).QueryService(ref sid, ref iid);
+            sv = ((IShellBrowser)sb).QueryActiveShellView();
+            var fv = (IFolderView)sv;
+            if (fv.GetAutoArrange() == 0) return 0; // S_OK: αυτόματη τακτοποίηση ενεργή, τα Windows ορίζουν τις θέσεις
+
+            IntPtr lv = FindWindowEx(((IShellView)sv).GetWindow(), IntPtr.Zero, "SysListView32", null);
+            if (lv == IntPtr.Zero) return 0;
+            var origin = new POINT();
+            ClientToScreen(lv, ref origin);
+            POINT sp = fv.GetSpacing();
+            if (sp.X <= 0 || sp.Y <= 0) return 0;
+
+            int n = fv.ItemCount(SVGIO_ALLVIEW);
+            var cells = new List<Rectangle>();
+            for (int i = 0; i < n; i++)
+            {
+                IntPtr pidl = fv.Item(i);
+                pidls.Add(pidl);
+                POINT p = fv.GetItemPosition(pidl);
+                cells.Add(new Rectangle(p.X + origin.X, p.Y + origin.Y, sp.X, sp.Y));
+            }
+
+            // Το πλέγμα των Windows: η μετατόπιση που έχουν τα περισσότερα εικονίδια.
+            int offX = Mode(cells.Select(c => Mod(c.X - origin.X, sp.X)));
+            int offY = Mode(cells.Select(c => Mod(c.Y - origin.Y, sp.Y)));
+
+            int moved = 0;
+            for (int i = 0; i < n; i++)
+            {
+                Rectangle c = cells[i];
+                Rectangle core = Rectangle.Inflate(c, -sp.X / 4, -sp.Y / 4);
+                if (!fences.Any(f => f.IntersectsWith(core))) continue;
+
+                Rectangle? best = null; long bestD = long.MaxValue;
+                foreach (var scr in Screen.AllScreens)
+                {
+                    Rectangle wa = scr.WorkingArea;
+                    int x0 = origin.X + offX + (int)Math.Ceiling((wa.Left - origin.X - offX) / (double)sp.X) * sp.X;
+                    int y0 = origin.Y + offY + (int)Math.Ceiling((wa.Top - origin.Y - offY) / (double)sp.Y) * sp.Y;
+                    for (int x = x0; x + sp.X <= wa.Right; x += sp.X)
+                        for (int y = y0; y + sp.Y <= wa.Bottom; y += sp.Y)
+                        {
+                            long dx = x - c.X, dy = y - c.Y, d = dx * dx + dy * dy;
+                            if (d >= bestD) continue;
+                            var cand = new Rectangle(x, y, sp.X, sp.Y);
+                            if (fences.Any(f => f.IntersectsWith(cand))) continue;
+                            var inner = Rectangle.Inflate(cand, -2, -2);
+                            bool taken = false;
+                            for (int j = 0; j < cells.Count && !taken; j++)
+                                if (j != i && cells[j].IntersectsWith(inner)) taken = true;
+                            if (taken) continue;
+                            best = cand; bestD = d;
+                        }
+                }
+                if (best == null) { Log("Δεν βρέθηκε ελεύθερη θέση για εικονίδιο στο " + c.Location); continue; }
+
+                var pt = new POINT { X = best.Value.X - origin.X, Y = best.Value.Y - origin.Y };
+                fv.SelectAndPositionItems(1, new[] { pidls[i] }, new[] { pt }, SVSI_POSITIONITEM);
+                Log("Εικονίδιο από " + c.Location + " σε " + best.Value.Location);
+                cells[i] = best.Value;
+                moved++;
+            }
+            return moved;
+        }
+        catch (Exception ex) { Log("Σφάλμα: " + ex.Message); return 0; }
+        finally
+        {
+            foreach (var p in pidls) Marshal.FreeCoTaskMem(p);
+            foreach (var o in new[] { sv, sb, disp, sw })
+                if (o != null && Marshal.IsComObject(o)) Marshal.ReleaseComObject(o);
+        }
+    }
+
+    static int Mod(int a, int m) { return ((a % m) + m) % m; }
+
+    static int Mode(IEnumerable<int> values)
+    {
+        var g = values.GroupBy(v => v).OrderByDescending(x => x.Count()).FirstOrDefault();
+        return g == null ? 0 : g.Key;
+    }
+
+    static string lastLog;
+    static void Log(string msg)
+    {
+        if (logPath == null || msg == lastLog) return;
+        lastLog = msg;
+        try
+        {
+            if (File.Exists(logPath) && new FileInfo(logPath).Length > 200000) File.Delete(logPath);
+            File.AppendAllText(logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine);
+        }
+        catch { }
+    }
 }
 
 static class Native
@@ -258,6 +430,7 @@ static class Program
 
             CreateTray();
             WatchDisplays();
+            WatchDesktopIcons();
             Application.Run();
             tray.Visible = false;
         }
@@ -330,6 +503,24 @@ static class Program
     public static void RelayoutAll()
     {
         foreach (var f in Forms) f.ApplyLayout();
+    }
+
+    static System.Windows.Forms.Timer iconTimer;
+
+    // Κάθε 2 δευτερόλεπτα: όποιο εικονίδιο της επιφάνειας εργασίας βρίσκεται κάτω από fence βγαίνει έξω.
+    static void WatchDesktopIcons()
+    {
+        iconTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        iconTimer.Tick += (s, e) => KeepIconsOut();
+        iconTimer.Start();
+    }
+
+    static void KeepIconsOut()
+    {
+        // Όχι όσο ο χρήστης σέρνει κάτι (εικονίδιο ή fence).
+        if (Cfg.AllowIconsUnder || Control.MouseButtons != MouseButtons.None) return;
+        var rects = Forms.Where(f => f.Visible && f.WindowState == FormWindowState.Normal).Select(f => f.Bounds).ToList();
+        DesktopIcons.KeepOutOf(rects, Path.Combine(Path.GetDirectoryName(CfgPath), "icons.log"));
     }
 
     public static int IconPixels(int dpi)
@@ -430,6 +621,9 @@ static class Program
         var startup = new ToolStripMenuItem("Εκκίνηση με τα Windows") { Checked = IsStartupEnabled() };
         startup.Click += (s, e) => { SetStartup(!startup.Checked); startup.Checked = IsStartupEnabled(); };
         menu.Items.Add(startup);
+        var keepOut = new ToolStripMenuItem("Τα εικονίδια μένουν έξω από τα fences") { Checked = !Cfg.AllowIconsUnder };
+        keepOut.Click += (s, e) => { Cfg.AllowIconsUnder = keepOut.Checked; Save(); keepOut.Checked = !Cfg.AllowIconsUnder; KeepIconsOut(); };
+        menu.Items.Add(keepOut);
         menu.Items.Add("Επαναφορά θέσεων fences", null, (s, e) => RelayoutAll());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Έξοδος", null, (s, e) => Exit());
