@@ -363,12 +363,18 @@ static class Native
         {
             var rc = new RECT { L = r.Left, T = r.Top, R = r.Right, B = r.Bottom };
             uint x, y;
-            if (GetDpiForMonitor(MonitorFromRect(ref rc, 2 /* MONITOR_DEFAULTTONEAREST */), 0, out x, out y) == 0) return (int)x;
+            if (GetDpiForMonitor(MonitorFromRect(ref rc, 2 /* MONITOR_DEFAULTTONEAREST */), 0, out x, out y) == 0 && ValidDpi((int)x))
+                return (int)x;
         }
         catch (DllNotFoundException) { }
         catch (EntryPointNotFoundException) { }
-        using (var g = Graphics.FromHwnd(IntPtr.Zero)) return (int)g.DpiX;
+        // Κατά τη σύνδεση/αποσύνδεση Remote Desktop οι οθόνες μπορεί για λίγο να δίνουν άκυρο DPI (π.χ. 0).
+        try { using (var g = Graphics.FromHwnd(IntPtr.Zero)) if (ValidDpi((int)g.DpiX)) return (int)g.DpiX; }
+        catch (Exception) { }
+        return 96;
     }
+
+    public static bool ValidDpi(int dpi) { return dpi >= 48 && dpi <= 960; }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
     public struct SHFILEINFO
@@ -418,16 +424,32 @@ static class Program
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            // Ένα σφάλμα δεν πρέπει να κλείνει το πρόγραμμα (το παράθυρο σφάλματος του .NET έχει κουμπί "Quit"):
+            // καταγράφεται στο errors.log και το DeskFences συνεχίζει.
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) => LogError(e.Exception);
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => LogError(e.ExceptionObject as Exception);
+
             BaseDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DeskFences");
-            string cfgDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DeskFences");
+            // Οι ρυθμίσεις μένουν δίπλα στους φακέλους των fences (κρυφός φάκελος .deskfences) και όχι στο %APPDATA%:
+            // εφαρμογές σε "πακέτο" (MSIX) βλέπουν δικό τους, εικονικό %APPDATA%, οπότε το DeskFences έβρισκε
+            // άλλες ρυθμίσεις ανάλογα με το ποιος το ξεκινούσε.
+            string cfgDir = Path.Combine(BaseDir, ".deskfences");
             Directory.CreateDirectory(BaseDir);
             Directory.CreateDirectory(cfgDir);
+            try { File.SetAttributes(cfgDir, File.GetAttributes(cfgDir) | FileAttributes.Hidden); } catch { }
             CfgPath = Path.Combine(cfgDir, "config.json");
+            string oldCfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DeskFences", "config.json");
+            if (!File.Exists(CfgPath) && File.Exists(oldCfg))
+            {
+                try { File.Copy(oldCfg, CfgPath); } catch (Exception ex) { LogError(ex); }
+            }
             Load();
 
             if (Cfg.Fences.Count == 0) NewFence("Fence 1", false);
             else foreach (var d in Cfg.Fences) ShowFence(d);
 
+            try { MigrateStartup(); } catch (Exception ex) { LogError(ex); }
             CreateTray();
             WatchDisplays();
             WatchDesktopIcons();
@@ -502,7 +524,24 @@ static class Program
 
     public static void RelayoutAll()
     {
-        foreach (var f in Forms) f.ApplyLayout();
+        // Ενδιάμεση κατάσταση οθονών (π.χ. αμέσως μετά από αποσύνδεση Remote Desktop): ξαναδοκιμάζουμε αργότερα.
+        if (Screen.AllScreens.Any(s => s.Bounds.Width < 200 || s.Bounds.Height < 200)) { relayoutTimer.Start(); return; }
+        foreach (var f in Forms)
+        {
+            try { f.ApplyLayout(); }
+            catch (Exception ex) { LogError(ex); }
+        }
+    }
+
+    public static void LogError(Exception ex)
+    {
+        try
+        {
+            string path = Path.Combine(Path.GetDirectoryName(CfgPath), "errors.log");
+            if (File.Exists(path) && new FileInfo(path).Length > 500000) File.Delete(path);
+            File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + ex + Environment.NewLine + Environment.NewLine);
+        }
+        catch { }
     }
 
     static System.Windows.Forms.Timer iconTimer;
@@ -634,20 +673,85 @@ static class Program
         tray.DoubleClick += (s, e) => NewFence("Νέο Fence", true);
     }
 
+    // Η εκκίνηση γίνεται με εργασία του Task Scheduler κατά τη σύνδεση (όχι με το κλειδί Run του μητρώου,
+    // που ο Explorer μερικές φορές παρέλειπε). Η εργασία ξαναξεκινά το DeskFences αν κλείσει με σφάλμα.
     static bool IsStartupEnabled()
     {
-        using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
-            return k != null && k.GetValue(AppName) != null;
+        return RunHidden("schtasks.exe", "/Query /TN " + AppName) == 0;
     }
 
     static void SetStartup(bool on)
     {
         using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+            if (k != null) k.DeleteValue(AppName, false);
+        if (!on) { RunHidden("schtasks.exe", "/Delete /TN " + AppName + " /F"); return; }
+
+        string user = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
+        string exe = Application.ExecutablePath;
+        Func<string, string> esc = System.Security.SecurityElement.Escape;
+        string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n" +
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n" +
+            "  <RegistrationInfo><Description>Εκκίνηση του DeskFences κατά τη σύνδεση</Description></RegistrationInfo>\n" +
+            "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + esc(user) + "</UserId><Delay>PT20S</Delay></LogonTrigger></Triggers>\n" +
+            "  <Principals><Principal id=\"Author\"><UserId>" + esc(user) + "</UserId><LogonType>InteractiveToken</LogonType>" +
+                "<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n" +
+            "  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" +
+                "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" +
+                "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>5</Count></RestartOnFailure>" +
+                "<Enabled>true</Enabled></Settings>\n" +
+            "  <Actions Context=\"Author\"><Exec><Command>" + esc(exe) + "</Command><WorkingDirectory>" +
+                esc(Path.GetDirectoryName(exe)) + "</WorkingDirectory></Exec></Actions>\n" +
+            "</Task>\n";
+        string tmp = Path.Combine(Path.GetTempPath(), "DeskFences-task.xml");
+        File.WriteAllText(tmp, xml, System.Text.Encoding.Unicode);
+        try
         {
-            if (k == null) return;
-            if (on) k.SetValue(AppName, "\"" + Application.ExecutablePath + "\"");
-            else k.DeleteValue(AppName, false);
+            if (RunHidden("schtasks.exe", "/Create /TN " + AppName + " /XML \"" + tmp + "\" /F") != 0)
+                MessageBox.Show("Δεν ήταν δυνατή η ρύθμιση της αυτόματης εκκίνησης.", AppName);
         }
+        finally { File.Delete(tmp); }
+    }
+
+    // Παλιές εκδόσεις έβαζαν το DeskFences στο κλειδί Run· μεταφέρεται στον Task Scheduler.
+    // Αν η εργασία δείχνει σε άλλη θέση του προγράμματος, ενημερώνεται.
+    static void MigrateStartup()
+    {
+        bool legacy;
+        using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+            legacy = k != null && k.GetValue(AppName) != null;
+        if (legacy) { SetStartup(true); return; }
+        if (!IsStartupEnabled()) return;
+        var psi = new ProcessStartInfo("schtasks.exe", "/Query /TN " + AppName + " /XML")
+        {
+            CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true
+        };
+        using (var p = Process.Start(psi))
+        {
+            string xml = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            if (xml.IndexOf(System.Security.SecurityElement.Escape(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase) < 0)
+                SetStartup(true);
+        }
+    }
+
+    static int RunHidden(string exe, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(exe, args)
+            {
+                CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                p.StandardOutput.ReadToEnd();
+                p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(15000)) return -1;
+                return p.ExitCode;
+            }
+        }
+        catch (Exception ex) { LogError(ex); return -1; }
     }
 }
 
@@ -736,6 +840,7 @@ class FenceForm : Form
     // Τα μεγέθη ορίζονται σε pixels για το DPI της οθόνης (η WinForms του .NET Framework δεν το κάνει μόνη της).
     void ApplyDpi(int newDpi)
     {
+        if (!Native.ValidDpi(newDpi)) return;
         dpi = newDpi;
         edge = Px(4);
         Padding = new Padding(Math.Max(1, edge - 2));
