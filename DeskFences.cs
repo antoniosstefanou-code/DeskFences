@@ -39,6 +39,8 @@ public class FenceData
     public int Color { get; set; }
     public int Opacity { get; set; }
     public bool Locked { get; set; }
+    // Σειρά των εικονιδίων (ονόματα αρχείων) όπως την όρισε ο χρήστης· όσα λείπουν μπαίνουν στο τέλος αλφαβητικά.
+    public List<string> Order { get; set; }
 }
 
 // Κάθε συνδυασμός οθονών (γραφείο, Remote Desktop από το σπίτι κ.λπ.) έχει δική του διάταξη.
@@ -794,6 +796,7 @@ class FenceForm : Form
         list.DragEnter += List_DragOver;
         list.DragOver += List_DragOver;
         list.DragDrop += List_DragDrop;
+        list.DragLeave += List_DragLeave;
         list.AfterLabelEdit += List_AfterLabelEdit;
         list.MouseUp += List_MouseUp;
         list.KeyDown += List_KeyDown;
@@ -988,9 +991,15 @@ class FenceForm : Form
         imgs.Images.Clear();
         if (Directory.Exists(D.Folder))
         {
+            var rank = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (D.Order != null)
+                for (int i = 0; i < D.Order.Count; i++)
+                    if (!rank.ContainsKey(D.Order[i])) rank[D.Order[i]] = i;
+            int none = int.MaxValue;
             var entries = new DirectoryInfo(D.Folder).GetFileSystemInfos()
                 .Where(fi => (fi.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0)
-                .OrderBy(fi => fi is DirectoryInfo ? 0 : 1)
+                .OrderBy(fi => rank.ContainsKey(fi.Name) ? rank[fi.Name] : none)
+                .ThenBy(fi => fi is DirectoryInfo ? 0 : 1)
                 .ThenBy(fi => fi.Name, StringComparer.CurrentCultureIgnoreCase);
             foreach (var fi in entries)
             {
@@ -1096,22 +1105,67 @@ class FenceForm : Form
 
     void List_DragOver(object sender, DragEventArgs e)
     {
-        if (draggingOut || !e.Data.GetDataPresent(DataFormats.FileDrop)) { e.Effect = DragDropEffects.None; return; }
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop)) { e.Effect = DragDropEffects.None; HideMark(); return; }
+        ShowMark(new Point(e.X, e.Y));
+        // Σύρσιμο μέσα στο ίδιο fence: αλλαγή σειράς.
+        if (draggingOut) { e.Effect = DragDropEffects.Move; return; }
         bool ctrl = (e.KeyState & 8) != 0;
         e.Effect = ctrl && (e.AllowedEffect & DragDropEffects.Copy) != 0 ? DragDropEffects.Copy
                  : (e.AllowedEffect & DragDropEffects.Move) != 0 ? DragDropEffects.Move
                  : (e.AllowedEffect & DragDropEffects.Copy);
     }
 
-    void List_DragDrop(object sender, DragEventArgs e)
+    void List_DragLeave(object sender, EventArgs e) { HideMark(); }
+
+    // Η θέση όπου θα μπει ό,τι αφεθεί: ο δείκτης στη λίστα (0..Count).
+    int DropIndex(Point screen)
     {
-        var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
-        if (paths == null) return;
-        ImportPaths(paths, e.Effect == DragDropEffects.Copy);
+        Point p = list.PointToClient(screen);
+        int i = list.InsertionMark.NearestIndex(p);
+        if (i < 0) return list.Items.Count;
+        Rectangle b = list.GetItemRect(i);
+        return p.X > b.Left + b.Width / 2 ? i + 1 : i;
     }
 
-    void ImportPaths(string[] paths, bool copy)
+    void ShowMark(Point screen)
     {
+        Point p = list.PointToClient(screen);
+        int i = list.InsertionMark.NearestIndex(p);
+        if (i < 0) { HideMark(); return; }
+        Rectangle b = list.GetItemRect(i);
+        list.InsertionMark.AppearsAfterItem = p.X > b.Left + b.Width / 2;
+        list.InsertionMark.Index = i;
+    }
+
+    void HideMark() { list.InsertionMark.Index = -1; }
+
+    void List_DragDrop(object sender, DragEventArgs e)
+    {
+        int at = DropIndex(new Point(e.X, e.Y));
+        HideMark();
+        var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
+        if (paths == null) return;
+        if (draggingOut) { Reorder(paths.Select(p => Path.GetFileName(p.TrimEnd('\\'))).ToList(), at); return; }
+        ImportPaths(paths, e.Effect == DragDropEffects.Copy, at);
+    }
+
+    // Βάζει τα ονόματα στη θέση at της τωρινής σειράς και την αποθηκεύει.
+    void Reorder(List<string> names, int at)
+    {
+        var cur = list.Items.Cast<ListViewItem>().Select(it => Path.GetFileName((string)it.Tag)).ToList();
+        var set = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+        int before = cur.Take(Math.Min(at, cur.Count)).Count(n => set.Contains(n));
+        cur.RemoveAll(n => set.Contains(n));
+        at = Math.Max(0, Math.Min(cur.Count, at - before));
+        cur.InsertRange(at, names.Where(n => !cur.Contains(n, StringComparer.OrdinalIgnoreCase)));
+        D.Order = cur;
+        Program.Save();
+        RefreshItems();
+    }
+
+    void ImportPaths(string[] paths, bool copy, int at = -1)
+    {
+        var added = new List<string>();
         string folder = Path.GetFullPath(D.Folder).TrimEnd('\\');
         foreach (var p in paths)
         {
@@ -1134,11 +1188,14 @@ class FenceForm : Form
                     if (copy) VBFS.CopyFile(p, dest, UIOption.OnlyErrorDialogs);
                     else VBFS.MoveFile(p, dest, UIOption.OnlyErrorDialogs);
                 }
+                if (File.Exists(dest) || Directory.Exists(dest)) added.Add(Path.GetFileName(dest));
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { MessageBox.Show("Δεν ήταν δυνατή η μεταφορά του \"" + name + "\":\n" + ex.Message, "DeskFences"); }
         }
-        RefreshItems();
+        // Τα νέα μπαίνουν εκεί όπου αφέθηκαν.
+        if (at >= 0 && added.Count > 0) Reorder(added, at);
+        else RefreshItems();
     }
 
     void MoveToDesktop(IEnumerable<string> paths)
@@ -1195,6 +1252,13 @@ class FenceForm : Form
         {
             if (isDir) VBFS.RenameDirectory(oldPath, newName);
             else VBFS.RenameFile(oldPath, newName);
+            // Το εικονίδιο κρατά τη θέση του στη σειρά.
+            string oldName = Path.GetFileName(oldPath);
+            if (D.Order != null)
+            {
+                int k = D.Order.FindIndex(n => string.Equals(n, oldName, StringComparison.OrdinalIgnoreCase));
+                if (k >= 0) { D.Order[k] = newName; Program.Save(); }
+            }
         }
         catch (Exception ex) { MessageBox.Show(ex.Message, "DeskFences"); }
         RefreshItems();
